@@ -3,15 +3,16 @@ import re
 import os
 from rapidfuzz import process, fuzz
 import numpy as np
+from sentence_transformers import SentenceTransformer
 
 # =========================
 # CONFIG
 # =========================
 EXTRACTION_FILE = "extraction.xlsx"
-EXTRACTION_SHEET = "Sheet1"   # 👈 CHANGE THIS
+EXTRACTION_SHEET = "Sheet1"
 
 MASTER_FILE = "master_category.xlsx"
-MASTER_SHEET = "Sheet1"       # 👈 CHANGE IF NEEDED
+MASTER_SHEET = "Sheet1"
 
 OUTPUT_FOLDER = "output"
 
@@ -21,14 +22,15 @@ GL_COL = "gldescription"
 CATEGORY_COL = "Category"
 KEYWORDS_COL = "Keywords"
 
+# Thresholds (tune if needed)
+FUZZY_THRESHOLD = 75
+NLP_THRESHOLD = 0.6
+
 # =========================
-# CREATE OUTPUT FOLDER
+# SETUP
 # =========================
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# =========================
-# LOAD DATA (WITH SHEET)
-# =========================
 df = pd.read_excel(EXTRACTION_FILE, sheet_name=EXTRACTION_SHEET)
 master_df = pd.read_excel(MASTER_FILE, sheet_name=MASTER_SHEET)
 
@@ -64,18 +66,24 @@ for _, row in master_df.iterrows():
 keyword_list = list(set(keyword_list))
 
 # =========================
-# MATCH FUNCTION
+# LOAD NLP MODEL (fallback only)
+# =========================
+model = SentenceTransformer('all-MiniLM-L6-v2')
+keyword_embeddings = model.encode(keyword_list, convert_to_numpy=True)
+
+# =========================
+# MATCH FUNCTION (HYBRID)
 # =========================
 def match_category(text):
     if not text:
         return None, 0, None, None
 
-    # 1. Exact match
+    # -------- 1. Exact match --------
     for kw in keyword_list:
         if kw in text:
             return keyword_to_category[kw], 100, kw, "exact"
 
-    # 2. Fuzzy match
+    # -------- 2. Fuzzy match --------
     match = process.extractOne(
         text,
         keyword_list,
@@ -85,8 +93,24 @@ def match_category(text):
 
     if match:
         best_kw, score, _ = match
-        if score >= 75:
+
+        if score >= FUZZY_THRESHOLD:
             return keyword_to_category[best_kw], score, best_kw, "fuzzy"
+
+    # -------- 3. NLP fallback --------
+    text_embedding = model.encode([text], convert_to_numpy=True)
+
+    similarities = np.dot(keyword_embeddings, text_embedding.T).flatten()
+    best_idx = np.argmax(similarities)
+    best_score = similarities[best_idx]
+
+    if best_score >= NLP_THRESHOLD:
+        return (
+            keyword_to_category[keyword_list[best_idx]],
+            int(best_score * 100),
+            keyword_list[best_idx],
+            "nlp"
+        )
 
     return None, 0, None, None
 
@@ -135,19 +159,19 @@ invoice_result = (
 final_df = df.merge(invoice_result, on=INVOICE_COL, how="left")
 
 # =========================
-# OUTPUT FILE NAME LOGIC
+# OUTPUT NAMING
 # =========================
 base_name = os.path.basename(EXTRACTION_FILE)
-file_name_without_ext = os.path.splitext(base_name)[0]
+file_name = os.path.splitext(base_name)[0]
 
-output_file_path = os.path.join(
+output_path = os.path.join(
     OUTPUT_FOLDER,
-    f"{file_name_without_ext}_glcat.xlsx"
+    f"{file_name}_glcat.xlsx"
 )
 
 # =========================
 # SAVE OUTPUT
 # =========================
-final_df.to_excel(output_file_path, index=False)
+final_df.to_excel(output_path, index=False)
 
-print(f"✅ Output saved at: {output_file_path}")
+print(f"✅ Done! File saved at: {output_path}")

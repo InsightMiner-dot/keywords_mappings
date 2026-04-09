@@ -1,25 +1,20 @@
 import pandas as pd
 import re
+import os
 from rapidfuzz import process, fuzz
 import numpy as np
 
-# OPTIONAL NLP (set False if you want ultra-fast only)
-USE_NLP_FALLBACK = False
-
-if USE_NLP_FALLBACK:
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-
 # =========================
-# FILE PATHS
+# CONFIG
 # =========================
 EXTRACTION_FILE = "extraction.xlsx"
-MASTER_FILE = "master_category.xlsx"
-OUTPUT_FILE = "final_output.xlsx"
+EXTRACTION_SHEET = "Sheet1"   # 👈 CHANGE THIS
 
-# =========================
-# COLUMN CONFIG
-# =========================
+MASTER_FILE = "master_category.xlsx"
+MASTER_SHEET = "Sheet1"       # 👈 CHANGE IF NEEDED
+
+OUTPUT_FOLDER = "output"
+
 INVOICE_COL = "invoice_number"
 GL_COL = "gldescription"
 
@@ -27,10 +22,15 @@ CATEGORY_COL = "Category"
 KEYWORDS_COL = "Keywords"
 
 # =========================
-# LOAD DATA
+# CREATE OUTPUT FOLDER
 # =========================
-df = pd.read_excel(EXTRACTION_FILE)
-master_df = pd.read_excel(MASTER_FILE)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# =========================
+# LOAD DATA (WITH SHEET)
+# =========================
+df = pd.read_excel(EXTRACTION_FILE, sheet_name=EXTRACTION_SHEET)
+master_df = pd.read_excel(MASTER_FILE, sheet_name=MASTER_SHEET)
 
 # =========================
 # CLEAN TEXT
@@ -61,53 +61,32 @@ for _, row in master_df.iterrows():
             keyword_to_category[kw_clean] = category
             keyword_list.append(kw_clean)
 
-keyword_list = list(set(keyword_list))  # remove duplicates
-
-# OPTIONAL NLP EMBEDDINGS
-if USE_NLP_FALLBACK:
-    keyword_embeddings = model.encode(keyword_list, convert_to_numpy=True)
+keyword_list = list(set(keyword_list))
 
 # =========================
-# MATCH FUNCTION (FINAL)
+# MATCH FUNCTION
 # =========================
 def match_category(text):
     if not text:
         return None, 0, None, None
 
-    # -------- 1. Exact match --------
+    # 1. Exact match
     for kw in keyword_list:
         if kw in text:
             return keyword_to_category[kw], 100, kw, "exact"
 
-    # -------- 2. Fuzzy match --------
+    # 2. Fuzzy match
     match = process.extractOne(
         text,
         keyword_list,
         scorer=fuzz.token_set_ratio,
-        score_cutoff=70   # speed optimization
+        score_cutoff=70
     )
 
     if match:
         best_kw, score, _ = match
-
         if score >= 75:
             return keyword_to_category[best_kw], score, best_kw, "fuzzy"
-
-    # -------- 3. NLP fallback (optional) --------
-    if USE_NLP_FALLBACK:
-        text_embedding = model.encode([text], convert_to_numpy=True)
-        similarities = np.dot(keyword_embeddings, text_embedding.T).flatten()
-
-        best_idx = np.argmax(similarities)
-        best_score = similarities[best_idx]
-
-        if best_score >= 0.6:
-            return (
-                keyword_to_category[keyword_list[best_idx]],
-                int(best_score * 100),
-                keyword_list[best_idx],
-                "nlp"
-            )
 
     return None, 0, None, None
 
@@ -122,7 +101,7 @@ df["Matched_Keyword"] = results.apply(lambda x: x[2])
 df["Match_Type"] = results.apply(lambda x: x[3])
 
 # =========================
-# INVOICE-LEVEL LOGIC
+# INVOICE LEVEL LOGIC
 # =========================
 def assign_invoice_category(group):
     matched = group.dropna(subset=["Temp_Category"])
@@ -156,8 +135,19 @@ invoice_result = (
 final_df = df.merge(invoice_result, on=INVOICE_COL, how="left")
 
 # =========================
+# OUTPUT FILE NAME LOGIC
+# =========================
+base_name = os.path.basename(EXTRACTION_FILE)
+file_name_without_ext = os.path.splitext(base_name)[0]
+
+output_file_path = os.path.join(
+    OUTPUT_FOLDER,
+    f"{file_name_without_ext}_glcat.xlsx"
+)
+
+# =========================
 # SAVE OUTPUT
 # =========================
-final_df.to_excel(OUTPUT_FILE, index=False)
+final_df.to_excel(output_file_path, index=False)
 
-print("✅ FINAL PIPELINE COMPLETED SUCCESSFULLY!")
+print(f"✅ Output saved at: {output_file_path}")

@@ -1,7 +1,7 @@
 import pandas as pd
 import re
 import os
-from rapidfuzz import process, fuzz
+from rapidfuzz import fuzz
 
 # =========================
 # CONFIG
@@ -20,8 +20,7 @@ GL_COL = "gldescription"
 CATEGORY_COL = "Category"
 KEYWORDS_COL = "Keywords"
 
-# Fuzzy threshold (tune carefully)
-FUZZY_THRESHOLD = 70   # lower = less miss (important)
+FUZZY_THRESHOLD = 70  # tune if needed
 
 # =========================
 # SETUP
@@ -45,6 +44,12 @@ def clean_text(text):
 df[GL_COL] = df[GL_COL].apply(clean_text)
 
 # =========================
+# CLEAN INVOICE (VERY IMPORTANT)
+# =========================
+df[INVOICE_COL] = df[INVOICE_COL].astype(str).str.strip()
+df[INVOICE_COL] = df[INVOICE_COL].fillna("UNKNOWN_INVOICE")
+
+# =========================
 # BUILD KEYWORD MAP
 # =========================
 keyword_to_category = {}
@@ -63,7 +68,7 @@ for _, row in master_df.iterrows():
 keyword_list = list(set(keyword_list))
 
 # =========================
-# MATCH FUNCTION (NO MISS VERSION)
+# MATCH FUNCTION (NO MISS)
 # =========================
 def match_category(text):
     if not text:
@@ -72,13 +77,12 @@ def match_category(text):
     best_score = 0
     best_keyword = None
 
-    # -------- 1. Strong substring match --------
+    # 1. Exact match
     for kw in keyword_list:
         if kw in text:
             return keyword_to_category[kw], 100, kw, "exact"
 
-    # -------- 2. FULL fuzzy scan (NO SKIP) --------
-    # This ensures we don't miss anything
+    # 2. Full fuzzy scan (no miss)
     for kw in keyword_list:
         score = fuzz.token_set_ratio(text, kw)
 
@@ -86,7 +90,7 @@ def match_category(text):
             best_score = score
             best_keyword = kw
 
-    # -------- 3. Assign if above threshold --------
+    # 3. Assign category
     if best_score >= FUZZY_THRESHOLD:
         return (
             keyword_to_category[best_keyword],
@@ -108,38 +112,35 @@ df["Matched_Keyword"] = results.apply(lambda x: x[2])
 df["Match_Type"] = results.apply(lambda x: x[3])
 
 # =========================
-# INVOICE LEVEL LOGIC
+# INVOICE LEVEL (NO APPLY)
 # =========================
-def assign_invoice_category(group):
-    matched = group.dropna(subset=["Temp_Category"])
-
-    if len(matched) > 0:
-        best_row = matched.sort_values("Confidence", ascending=False).iloc[0]
-
-        return pd.Series({
-            "Final_Category": best_row["Temp_Category"],
-            "Final_Confidence": best_row["Confidence"],
-            "Final_Match_Type": best_row["Match_Type"],
-            "Final_Keyword": best_row["Matched_Keyword"]
-        })
-    else:
-        return pd.Series({
-            "Final_Category": "Others",
-            "Final_Confidence": 0,
-            "Final_Match_Type": "no_match",
-            "Final_Keyword": None
-        })
-
 invoice_result = (
-    df.groupby(INVOICE_COL)
-      .apply(assign_invoice_category)
-      .reset_index()
+    df.sort_values("Confidence", ascending=False)
+      .groupby(INVOICE_COL, as_index=False)
+      .first()
 )
+
+# Rename final columns
+invoice_result = invoice_result.rename(columns={
+    "Temp_Category": "Final_Category",
+    "Confidence": "Final_Confidence",
+    "Match_Type": "Final_Match_Type",
+    "Matched_Keyword": "Final_Keyword"
+})
+
+# Fill no-match invoices
+invoice_result["Final_Category"] = invoice_result["Final_Category"].fillna("Others")
+invoice_result["Final_Confidence"] = invoice_result["Final_Confidence"].fillna(0)
 
 # =========================
 # MERGE BACK
 # =========================
-final_df = df.merge(invoice_result, on=INVOICE_COL, how="left")
+final_df = df.merge(
+    invoice_result[[INVOICE_COL, "Final_Category", "Final_Confidence",
+                    "Final_Match_Type", "Final_Keyword"]],
+    on=INVOICE_COL,
+    how="left"
+)
 
 # =========================
 # OUTPUT NAMING

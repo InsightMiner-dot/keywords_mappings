@@ -3,17 +3,20 @@ import pandas as pd
 import re
 from rapidfuzz import fuzz
 from io import BytesIO
+import os
+from datetime import datetime
 
 # =========================
 # CONFIG
 # =========================
-# Set page config for a wider layout and browser tab title
 st.set_page_config(page_title="GL Mapping Tool", page_icon="📊", layout="wide")
 
 MASTER_FILE = "master_category.xlsx"
 CATEGORY_COL = "Category"
 KEYWORDS_COL = "GL Description"
-FUZZY_THRESHOLD = 70
+
+# Audit Config
+AUDIT_DIR = "audit_logs"
 
 # =========================
 # UTIL FUNCTIONS
@@ -42,13 +45,12 @@ def build_keyword_map(master_df):
 
     return keyword_to_category, list(set(keyword_list))
 
-# Cache the master data loading so it doesn't read from disk on every interaction
 @st.cache_data
 def load_master_data(file_path, sheet_name):
     df = pd.read_excel(file_path, sheet_name=sheet_name)
     return build_keyword_map(df)
 
-def match_category(text, keyword_list, keyword_to_category):
+def match_category(text, keyword_list, keyword_to_category, user_threshold):
     if not text:
         return None, 0
 
@@ -67,7 +69,7 @@ def match_category(text, keyword_list, keyword_to_category):
             best_score = score
             best_keyword = kw
 
-    if best_score >= FUZZY_THRESHOLD:
+    if best_score >= user_threshold:
         return keyword_to_category[best_keyword], best_score
 
     return None, best_score
@@ -105,7 +107,7 @@ def main():
         with st.sidebar.container(border=True):
             st.markdown("**📝 Column Mapping**")
             sheet_name = st.selectbox("Select Input Sheet", excel_file.sheet_names)
-            temp_df = pd.read_excel(uploaded_file, sheet_name=sheet_name, nrows=0) # Load just headers
+            temp_df = pd.read_excel(uploaded_file, sheet_name=sheet_name, nrows=0)
             columns = list(temp_df.columns)
 
             invoice_col = st.selectbox("Select Invoice Column", columns)
@@ -119,6 +121,17 @@ def main():
             except FileNotFoundError:
                 st.error(f"Missing '{MASTER_FILE}' in directory.")
                 return
+                
+    with st.sidebar.container(border=True):
+        st.markdown("**⚙️ Advanced Settings**")
+        user_threshold = st.slider(
+            "Fuzzy Match Threshold", 
+            min_value=0, 
+            max_value=100, 
+            value=70, 
+            step=1,
+            help="Higher values demand more exact matches. Lower values catch more variations but may increase false positives."
+        )
 
     run_button = st.sidebar.button("🚀 Run Mapping", use_container_width=True, type="primary")
 
@@ -131,7 +144,6 @@ def main():
             st.error("❌ Invoice and GL column cannot be the same.")
             return
 
-        # 1. Use st.status for a clean loading experience
         with st.status("🚀 Processing Mapping...", expanded=True) as status:
             st.write("📥 Loading user data...")
             df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
@@ -143,10 +155,10 @@ def main():
             st.write("📚 Loading master dictionary...")
             keyword_to_category, keyword_list = load_master_data(MASTER_FILE, master_sheet)
 
-            st.write("🔍 Performing fuzzy matching (this may take a moment)...")
+            st.write(f"🔍 Performing fuzzy matching (Threshold: {user_threshold}%)...")
             results = []
             for text in df[gl_col]:
-                results.append(match_category(text, keyword_list, keyword_to_category))
+                results.append(match_category(text, keyword_list, keyword_to_category, user_threshold))
 
             df["Temp_Category"] = [r[0] for r in results]
             df["Confidence"] = [r[1] for r in results]
@@ -172,26 +184,56 @@ def main():
                 how="left"
             )
 
-            st.write("📦 Preparing output file...")
+            st.write("📦 Preparing output file and saving to audit...")
             download_df = final_df.drop(columns=["Temp_Category", "Confidence"], errors="ignore")
             excel_data = to_excel(download_df)
 
-            status.update(label="✅ Mapping Complete!", state="complete", expanded=False)
+            # =========================
+            # AUDIT TRAIL LOGIC & METRICS
+            # =========================
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.makedirs(AUDIT_DIR, exist_ok=True)
+            
+            # 1. Save physical excel file backup
+            audit_file_path = os.path.join(AUDIT_DIR, f"mapping_output_{timestamp}.xlsx")
+            download_df.to_excel(audit_file_path, index=False)
 
-        # 2. Trigger non-intrusive toast notification
-        st.toast('Mapping successful! You can now review and download the results.', icon='🎉')
+            # 2. Calculate updated metrics (Unmapped is now Unique Invoices)
+            total_invoices = len(download_df[invoice_col].unique())
+            avg_confidence = download_df["Final_Confidence"].mean()
+            
+            # UPDATED: Count unique invoice IDs where the final category is "Others"
+            unmapped_invoices = download_df[download_df["Final_Category"] == "Others"][invoice_col].nunique()
 
-        # 3. Display High-Level Metrics
+            # 3. Append metrics to master tracking CSV
+            audit_csv_path = os.path.join(AUDIT_DIR, "audit_summary.csv")
+            audit_record = pd.DataFrame([{
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Input_Filename": uploaded_file.name,
+                "Fuzzy_Threshold": user_threshold,
+                "Total_Invoices": total_invoices,
+                "Avg_Confidence": round(avg_confidence, 2),
+                "Unmapped_Unique_Invoices": unmapped_invoices,
+                "Backup_File": f"mapping_output_{timestamp}.xlsx"
+            }])
+
+            if os.path.exists(audit_csv_path):
+                audit_record.to_csv(audit_csv_path, mode='a', header=False, index=False)
+            else:
+                audit_record.to_csv(audit_csv_path, index=False)
+            
+            status.update(label="✅ Mapping Complete & Audit Saved!", state="complete", expanded=False)
+
+        st.toast('Mapping successful! Results saved to audit log.', icon='🎉')
+
+        # Updated KPI Display
         st.subheader("Results Snapshot")
         col1, col2, col3 = st.columns(3)
         
-        total_invoices = len(download_df[invoice_col].unique())
-        avg_confidence = download_df["Final_Confidence"].mean()
-        unmapped = len(download_df[download_df["Final_Category"] == "Others"])
-
         col1.metric("Total Unique Invoices", f"{total_invoices:,}")
         col2.metric("Average Match Confidence", f"{avg_confidence:.1f}%")
-        col3.metric("Unmapped (Others)", f"{unmapped:,}", delta="- Action Recommended" if unmapped > 0 else None, delta_color="inverse")
+        # Updated label to reflect unique invoices
+        col3.metric("Unmapped Invoices (Others)", f"{unmapped_invoices:,}", delta="- Action Recommended" if unmapped_invoices > 0 else None, delta_color="inverse")
         
         st.divider()
 
@@ -210,7 +252,6 @@ def main():
             )
             
             st.write("### Data Preview")
-            # 4. Use st.column_config for visual progress bars in the table
             st.dataframe(
                 download_df,
                 use_container_width=True,

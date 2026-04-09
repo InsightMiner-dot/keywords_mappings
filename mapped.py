@@ -2,8 +2,6 @@ import pandas as pd
 import re
 import os
 from rapidfuzz import process, fuzz
-import numpy as np
-from sentence_transformers import SentenceTransformer
 
 # =========================
 # CONFIG
@@ -22,9 +20,8 @@ GL_COL = "gldescription"
 CATEGORY_COL = "Category"
 KEYWORDS_COL = "Keywords"
 
-# Thresholds (tune if needed)
-FUZZY_THRESHOLD = 75
-NLP_THRESHOLD = 0.6
+# Fuzzy threshold (tune carefully)
+FUZZY_THRESHOLD = 70   # lower = less miss (important)
 
 # =========================
 # SETUP
@@ -66,53 +63,39 @@ for _, row in master_df.iterrows():
 keyword_list = list(set(keyword_list))
 
 # =========================
-# LOAD NLP MODEL (fallback only)
-# =========================
-model = SentenceTransformer('all-MiniLM-L6-v2')
-keyword_embeddings = model.encode(keyword_list, convert_to_numpy=True)
-
-# =========================
-# MATCH FUNCTION (HYBRID)
+# MATCH FUNCTION (NO MISS VERSION)
 # =========================
 def match_category(text):
     if not text:
         return None, 0, None, None
 
-    # -------- 1. Exact match --------
+    best_score = 0
+    best_keyword = None
+
+    # -------- 1. Strong substring match --------
     for kw in keyword_list:
         if kw in text:
             return keyword_to_category[kw], 100, kw, "exact"
 
-    # -------- 2. Fuzzy match --------
-    match = process.extractOne(
-        text,
-        keyword_list,
-        scorer=fuzz.token_set_ratio,
-        score_cutoff=70
-    )
+    # -------- 2. FULL fuzzy scan (NO SKIP) --------
+    # This ensures we don't miss anything
+    for kw in keyword_list:
+        score = fuzz.token_set_ratio(text, kw)
 
-    if match:
-        best_kw, score, _ = match
+        if score > best_score:
+            best_score = score
+            best_keyword = kw
 
-        if score >= FUZZY_THRESHOLD:
-            return keyword_to_category[best_kw], score, best_kw, "fuzzy"
-
-    # -------- 3. NLP fallback --------
-    text_embedding = model.encode([text], convert_to_numpy=True)
-
-    similarities = np.dot(keyword_embeddings, text_embedding.T).flatten()
-    best_idx = np.argmax(similarities)
-    best_score = similarities[best_idx]
-
-    if best_score >= NLP_THRESHOLD:
+    # -------- 3. Assign if above threshold --------
+    if best_score >= FUZZY_THRESHOLD:
         return (
-            keyword_to_category[keyword_list[best_idx]],
-            int(best_score * 100),
-            keyword_list[best_idx],
-            "nlp"
+            keyword_to_category[best_keyword],
+            best_score,
+            best_keyword,
+            "fuzzy"
         )
 
-    return None, 0, None, None
+    return None, best_score, best_keyword, "low_match"
 
 # =========================
 # APPLY MATCHING
@@ -143,7 +126,7 @@ def assign_invoice_category(group):
         return pd.Series({
             "Final_Category": "Others",
             "Final_Confidence": 0,
-            "Final_Match_Type": None,
+            "Final_Match_Type": "no_match",
             "Final_Keyword": None
         })
 
@@ -174,4 +157,4 @@ output_path = os.path.join(
 # =========================
 final_df.to_excel(output_path, index=False)
 
-print(f"✅ Done! File saved at: {output_path}")
+print(f"✅ Completed! Output saved at: {output_path}")
